@@ -1,5 +1,5 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
 import google.generativeai as genai
 from PIL import Image
 import io
@@ -28,7 +28,7 @@ if "GEMINI_API_KEY" not in st.secrets:
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 # --------------------------------------------------
-# GEMINI MODEL (TEXT ONLY)
+# SAFE MODEL FOR STREAMLIT CLOUD
 # --------------------------------------------------
 model = genai.GenerativeModel("gemini-2.5-flash")
 
@@ -49,7 +49,7 @@ DOMAINS = [
 ]
 
 # --------------------------------------------------
-# LOAD BERT SUMMARIZER (CACHED)
+# LOAD BERT (CACHED)
 # --------------------------------------------------
 @st.cache_resource
 def load_bert():
@@ -58,42 +58,74 @@ def load_bert():
 bert_summarizer = load_bert()
 
 # --------------------------------------------------
+# SAFE GEMINI CALL
+# --------------------------------------------------
+def safe_generate(prompt):
+    try:
+        return model.generate_content(prompt).text
+    except Exception:
+        return "Explanation unavailable due to API limitations."
+
+# --------------------------------------------------
 # PDF EXTRACTION
 # --------------------------------------------------
 def extract_pdf_components(pdf_path):
     doc = fitz.open(pdf_path)
-
-    full_text = ""
+    text = ""
     images = []
     tables = []
     formulas = []
 
     for page_no, page in enumerate(doc, start=1):
         page_text = page.get_text()
-        full_text += page_text
+        text += page_text
 
-        # Images
+        # Images with page context
         for img_idx, img in enumerate(page.get_images(full=True)):
             xref = img[0]
             img_bytes = doc.extract_image(xref)["image"]
             image = Image.open(io.BytesIO(img_bytes))
-            images.append((page_no, img_idx + 1, image))
+            images.append((page_no, img_idx + 1, image, page_text))
 
-        # Tables (raw text blocks)
+        # Tables
         for block in page.get_text("blocks"):
             if "\t" in block[4]:
                 tables.append((page_no, block[4]))
 
-        # Formulas (raw patterns)
+        # Formulas
         formulas.extend(re.findall(r"\$.*?\$|\\\[.*?\\\]", page_text))
 
-    return full_text, images, tables, formulas
+    return text, images, tables, formulas
 
 # --------------------------------------------------
-# SUMMARY GENERATORS (<= 5000 CHARS EACH)
+# IMAGE EXPLANATION (TEXT-BASED, SAFE)
+# --------------------------------------------------
+def explain_image_from_text(page_text, domain):
+    context = page_text[:1500]
+
+    prompt = f"""
+    You are a domain expert in {domain}.
+
+    The following text appears on a page that contains a figure or image:
+
+    {context}
+
+    Based on this text:
+    - Infer what the image most likely represents
+    - Explain its purpose in the document
+    - Describe the insight it conveys
+
+    Do not mention that the image was inferred.
+    Write clearly and confidently.
+    """
+
+    return safe_generate(prompt)
+
+# --------------------------------------------------
+# SUMMARY FUNCTIONS (<= 5000 CHARS)
 # --------------------------------------------------
 def bert_summary(text, max_chars=5000):
-    chunk = text[:3000]  # BERT input limit
+    chunk = text[:3000]
     summary = bert_summarizer(
         chunk,
         max_length=180,
@@ -106,43 +138,30 @@ def bilstm_style_summary(text, domain, max_chars=5000):
     limited_text = text[:12000]
 
     prompt = f"""
-    You are generating a summary in the style of a BiLSTM-based sequence model.
+    Generate an abstractive summary in the style of a BiLSTM-based sequence model.
     Domain: {domain}
-
-    Characteristics:
-    - Abstractive
-    - Smooth sequential flow
-    - Captures context across the document
-    - No headings or bullet points
+    Single continuous text, no headings.
 
     Document:
     {limited_text}
     """
 
-    response = model.generate_content(prompt)
-    return response.text[:max_chars]
+    return safe_generate(prompt)[:max_chars]
 
 def hybrid_summary(bert_sum, bilstm_sum, domain, max_chars=5000):
     prompt = f"""
-    Combine the two summaries below into a single coherent summary.
+    Combine the two summaries below into one coherent summary.
     Domain: {domain}
+    No headings or bullet points.
 
-    Requirements:
-    - Preserve factual precision from BERT-style summary
-    - Preserve contextual flow from BiLSTM-style summary
-    - Single continuous text
-    - No headings or lists
-    - Maximum {max_chars} characters
-
-    BERT-style summary:
+    BERT summary:
     {bert_sum}
 
-    BiLSTM-style summary:
+    BiLSTM summary:
     {bilstm_sum}
     """
 
-    response = model.generate_content(prompt)
-    return response.text[:max_chars]
+    return safe_generate(prompt)[:max_chars]
 
 # --------------------------------------------------
 # UI FLOW
@@ -152,7 +171,7 @@ uploaded_file = st.file_uploader("Upload PDF document", type="pdf")
 if uploaded_file:
     domain = st.selectbox("Select summary domain", DOMAINS)
 
-    if st.button("Generate Summaries"):
+    if st.button("Generate Output"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(uploaded_file.read())
             pdf_path = tmp.name
@@ -162,14 +181,16 @@ if uploaded_file:
 
         st.success("Extraction completed")
 
-        # ---------------- DISPLAY EXTRACTED CONTENT ----------------
-        st.header("Extracted Images")
+        # ---------------- IMAGES + EXPLANATIONS ----------------
+        st.header("Extracted Images and Inferred Explanations")
         if images:
-            for p, i, img in images:
+            for p, i, img, page_text in images:
                 st.image(img, caption=f"Page {p}, Image {i}")
+                st.write(explain_image_from_text(page_text, domain))
         else:
             st.write("No images found.")
 
+        # ---------------- TABLES ----------------
         st.header("Extracted Tables")
         if tables:
             for p, table in tables:
@@ -177,6 +198,7 @@ if uploaded_file:
         else:
             st.write("No tables found.")
 
+        # ---------------- FORMULAS ----------------
         st.header("Extracted Formulas")
         if formulas:
             for f in formulas:
@@ -188,24 +210,24 @@ if uploaded_file:
         st.header("Generated Summaries")
 
         with st.spinner("Generating BERT-style summary"):
-            summary_bert = bert_summary(text)
+            s_bert = bert_summary(text)
 
         with st.spinner("Generating BiLSTM-style summary"):
-            summary_bilstm = bilstm_style_summary(text, domain)
+            s_bilstm = bilstm_style_summary(text, domain)
 
         with st.spinner("Generating Hybrid summary"):
-            summary_hybrid = hybrid_summary(summary_bert, summary_bilstm, domain)
+            s_hybrid = hybrid_summary(s_bert, s_bilstm, domain)
 
         st.subheader("BERT-style Summary")
-        st.write(f"Length: {len(summary_bert)} characters")
-        st.write(summary_bert)
+        st.write(f"Length: {len(s_bert)} characters")
+        st.write(s_bert)
 
         st.subheader("BiLSTM-style Summary")
-        st.write(f"Length: {len(summary_bilstm)} characters")
-        st.write(summary_bilstm)
+        st.write(f"Length: {len(s_bilstm)} characters")
+        st.write(s_bilstm)
 
-        st.subheader("Hybrid (BERT + BiLSTM) Summary")
-        st.write(f"Length: {len(summary_hybrid)} characters")
-        st.write(summary_hybrid)
+        st.subheader("Hybrid Summary (BERT + BiLSTM)")
+        st.write(f"Length: {len(s_hybrid)} characters")
+        st.write(s_hybrid)
 
         os.remove(pdf_path)
