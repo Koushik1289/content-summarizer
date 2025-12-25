@@ -1,0 +1,6 @@
+streamlit
+pymupdf
+google-generativeai
+transformers
+torch
+pillow
