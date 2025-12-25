@@ -30,7 +30,7 @@ genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 # --------------------------------------------------
 # SAFE MODEL FOR STREAMLIT CLOUD
 # --------------------------------------------------
-model = genai.GenerativeModel("gemini-2.5-flash")
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 # --------------------------------------------------
 # DOMAINS
@@ -64,7 +64,7 @@ def safe_generate(prompt):
     try:
         return model.generate_content(prompt).text
     except Exception:
-        return "Explanation unavailable due to API limitations."
+        return ""
 
 # --------------------------------------------------
 # PDF EXTRACTION
@@ -80,88 +80,77 @@ def extract_pdf_components(pdf_path):
         page_text = page.get_text()
         text += page_text
 
-        # Images with page context
         for img_idx, img in enumerate(page.get_images(full=True)):
             xref = img[0]
             img_bytes = doc.extract_image(xref)["image"]
             image = Image.open(io.BytesIO(img_bytes))
             images.append((page_no, img_idx + 1, image, page_text))
 
-        # Tables
         for block in page.get_text("blocks"):
             if "\t" in block[4]:
                 tables.append((page_no, block[4]))
 
-        # Formulas
         formulas.extend(re.findall(r"\$.*?\$|\\\[.*?\\\]", page_text))
 
     return text, images, tables, formulas
 
 # --------------------------------------------------
-# IMAGE EXPLANATION (TEXT-BASED, SAFE)
+# IMAGE EXPLANATION (TEXT-BASED)
 # --------------------------------------------------
 def explain_image_from_text(page_text, domain):
-    context = page_text[:1500]
-
     prompt = f"""
     You are a domain expert in {domain}.
+    Based on the following page text, infer the purpose of the image
+    and explain its role briefly.
 
-    The following text appears on a page that contains a figure or image:
-
-    {context}
-
-    Based on this text:
-    - Infer what the image most likely represents
-    - Explain its purpose in the document
-    - Describe the insight it conveys
-
-    Do not mention that the image was inferred.
-    Write clearly and confidently.
+    Page text:
+    {page_text[:1200]}
     """
-
     return safe_generate(prompt)
 
 # --------------------------------------------------
-# SUMMARY FUNCTIONS (<= 5000 CHARS)
+# SUMMARY FUNCTIONS (≈ 3000 CHARS EACH)
 # --------------------------------------------------
-def bert_summary(text, max_chars=5000):
-    chunk = text[:3000]
+def bert_summary(text, target_chars=3000):
+    chunk = text[:3500]
     summary = bert_summarizer(
         chunk,
-        max_length=180,
-        min_length=80,
+        max_length=220,
+        min_length=150,
         do_sample=False
     )[0]["summary_text"]
-    return summary[:max_chars]
+    return summary[:target_chars]
 
-def bilstm_style_summary(text, domain, max_chars=5000):
+def bilstm_style_summary(text, domain, target_chars=3000):
     limited_text = text[:12000]
 
     prompt = f"""
-    Generate an abstractive summary in the style of a BiLSTM-based sequence model.
+    Generate an abstractive summary similar to a BiLSTM-based sequence model.
     Domain: {domain}
-    Single continuous text, no headings.
+    Single continuous text.
+    Target length: approximately {target_chars} characters.
 
     Document:
     {limited_text}
     """
 
-    return safe_generate(prompt)[:max_chars]
+    return safe_generate(prompt)[:target_chars]
 
-def hybrid_summary(bert_sum, bilstm_sum, domain, max_chars=5000):
+def hybrid_summary(bert_sum, bilstm_sum, domain, target_chars=3000):
     prompt = f"""
     Combine the two summaries below into one coherent summary.
     Domain: {domain}
-    No headings or bullet points.
+    Single continuous text.
+    Target length: approximately {target_chars} characters.
 
-    BERT summary:
+    Summary A:
     {bert_sum}
 
-    BiLSTM summary:
+    Summary B:
     {bilstm_sum}
     """
 
-    return safe_generate(prompt)[:max_chars]
+    return safe_generate(prompt)[:target_chars]
 
 # --------------------------------------------------
 # UI FLOW
@@ -181,30 +170,21 @@ if uploaded_file:
 
         st.success("Extraction completed")
 
-        # ---------------- IMAGES + EXPLANATIONS ----------------
-        st.header("Extracted Images and Inferred Explanations")
-        if images:
-            for p, i, img, page_text in images:
-                st.image(img, caption=f"Page {p}, Image {i}")
-                st.write(explain_image_from_text(page_text, domain))
-        else:
-            st.write("No images found.")
+        # ---------------- IMAGES ----------------
+        st.header("Extracted Images and Context-Based Explanations")
+        for p, i, img, page_text in images:
+            st.image(img, caption=f"Page {p}, Image {i}")
+            st.write(explain_image_from_text(page_text, domain))
 
         # ---------------- TABLES ----------------
         st.header("Extracted Tables")
-        if tables:
-            for p, table in tables:
-                st.code(table)
-        else:
-            st.write("No tables found.")
+        for p, table in tables:
+            st.code(table)
 
         # ---------------- FORMULAS ----------------
         st.header("Extracted Formulas")
-        if formulas:
-            for f in formulas:
-                st.latex(f)
-        else:
-            st.write("No formulas found.")
+        for f in formulas:
+            st.latex(f)
 
         # ---------------- SUMMARIES ----------------
         st.header("Generated Summaries")
@@ -219,15 +199,15 @@ if uploaded_file:
             s_hybrid = hybrid_summary(s_bert, s_bilstm, domain)
 
         st.subheader("BERT-style Summary")
-        st.write(f"Length: {len(s_bert)} characters")
+        st.write(f"Characters: {len(s_bert)}")
         st.write(s_bert)
 
         st.subheader("BiLSTM-style Summary")
-        st.write(f"Length: {len(s_bilstm)} characters")
+        st.write(f"Characters: {len(s_bilstm)}")
         st.write(s_bilstm)
 
         st.subheader("Hybrid Summary (BERT + BiLSTM)")
-        st.write(f"Length: {len(s_hybrid)} characters")
+        st.write(f"Characters: {len(s_hybrid)}")
         st.write(s_hybrid)
 
         os.remove(pdf_path)
