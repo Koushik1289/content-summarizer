@@ -1,5 +1,5 @@
 import streamlit as st
-import fitz
+import fitz  # PyMuPDF
 import google.generativeai as genai
 from PIL import Image
 import io
@@ -12,9 +12,11 @@ from transformers import pipeline
 # PAGE CONFIG
 # --------------------------------------------------
 st.set_page_config(
-    page_title="Domain-Aware PDF Intelligence System",
+    page_title="Domain-Aware PDF Summarizer",
     layout="wide"
 )
+
+st.title("Domain-Aware PDF Summarizer")
 
 # --------------------------------------------------
 # LOAD API KEY FROM STREAMLIT CLOUD SECRETS
@@ -26,10 +28,9 @@ if "GEMINI_API_KEY" not in st.secrets:
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 # --------------------------------------------------
-# USE ONE STABLE MODEL ONLY
+# SINGLE STABLE MODEL
 # --------------------------------------------------
-MODEL_NAME = "gemini-1.5-pro"
-model = genai.GenerativeModel(MODEL_NAME)
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 # --------------------------------------------------
 # DOMAINS
@@ -67,64 +68,32 @@ def word_count(text):
 # --------------------------------------------------
 def extract_pdf_components(pdf_path):
     doc = fitz.open(pdf_path)
-    text = ""
+
+    full_text = ""
     images = []
     tables = []
     formulas = []
 
     for page_no, page in enumerate(doc, start=1):
         page_text = page.get_text()
-        text += page_text
+        full_text += page_text
 
+        # Images
         for img_idx, img in enumerate(page.get_images(full=True)):
             xref = img[0]
             img_bytes = doc.extract_image(xref)["image"]
             image = Image.open(io.BytesIO(img_bytes))
             images.append((page_no, img_idx + 1, image))
 
+        # Tables (raw blocks)
         for block in page.get_text("blocks"):
             if "\t" in block[4]:
                 tables.append((page_no, block[4]))
 
+        # Formulas (raw)
         formulas.extend(re.findall(r"\$.*?\$|\\\[.*?\\\]", page_text))
 
-    return text, images, tables, formulas
-
-# --------------------------------------------------
-# EXPLANATIONS (SAFE, NO VISION MODEL)
-# --------------------------------------------------
-def explain_image(image, domain):
-    try:
-        prompt = f"""
-        You are a domain expert in {domain}.
-        Explain the image in detail.
-        Describe what it represents, its components,
-        patterns, and its relevance to the document.
-        """
-        response = model.generate_content([prompt, image])
-        return response.text
-    except Exception:
-        return "Image explanation unavailable due to API or quota limitations."
-
-def explain_table(table_text, domain):
-    prompt = f"""
-    Explain the following table for a {domain} audience.
-    Discuss variables, trends, relationships, and implications.
-
-    Table:
-    {table_text}
-    """
-    return model.generate_content(prompt).text
-
-def explain_formula(formula, domain):
-    prompt = f"""
-    Explain this formula for a {domain} audience.
-    Describe variables, logic, and usage.
-
-    Formula:
-    {formula}
-    """
-    return model.generate_content(prompt).text
+    return full_text, images, tables, formulas
 
 # --------------------------------------------------
 # SUMMARIZATION
@@ -149,8 +118,8 @@ def bilstm_style_summary(text, domain):
 
 def gemini_domain_summary(text, domain):
     prompt = f"""
-    You are a senior expert in {domain}.
-    Produce a structured, domain-aware summary.
+    You are a domain expert in {domain}.
+    Generate a detailed domain-aware summary.
 
     Text:
     {text}
@@ -159,7 +128,7 @@ def gemini_domain_summary(text, domain):
 
 def ensemble_summary(bert, bilstm, gemini, domain):
     prompt = f"""
-    Combine the following summaries into one unified summary.
+    Combine the following summaries into a single coherent summary.
 
     Domain: {domain}
 
@@ -178,48 +147,46 @@ def ensemble_summary(bert, bilstm, gemini, domain):
 # LONG SUMMARY (>= 4000 WORDS)
 # --------------------------------------------------
 def generate_long_summary(base_summary, source_text, domain, min_words=4000):
-    final = base_summary
+    final_summary = base_summary
 
     sections = [
         "Introduction and Background",
         "Context and Motivation",
-        "Detailed Content Explanation",
-        "Technical or Conceptual Analysis",
-        "Domain-Specific Interpretation",
-        "Examples and Use Cases",
-        "Implications and Impact",
-        "Limitations and Challenges",
-        "Future Scope and Recommendations",
+        "Detailed Content Overview",
+        "Conceptual and Technical Analysis",
+        "Domain-Specific Perspective",
+        "Practical Implications",
+        "Challenges and Limitations",
+        "Future Scope",
         "Conclusion"
     ]
 
     for section in sections:
-        if word_count(final) >= min_words:
+        if word_count(final_summary) >= min_words:
             break
 
         prompt = f"""
         Write a detailed section titled '{section}' for a {domain} audience.
         Minimum 500 words.
-        Avoid repetition.
+        Do not repeat previous content.
 
-        Reference:
+        Reference text:
         {source_text[:6000]}
         """
-        final += "\n\n## " + section + "\n" + model.generate_content(prompt).text
+        section_text = model.generate_content(prompt).text
+        final_summary += f"\n\n## {section}\n{section_text}"
 
-    return final
+    return final_summary
 
 # --------------------------------------------------
-# UI
+# UI FLOW
 # --------------------------------------------------
-st.title("Domain-Aware PDF Intelligence System")
-
-uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+uploaded_file = st.file_uploader("Upload PDF document", type="pdf")
 
 if uploaded_file:
     domain = st.selectbox("Select summary domain", DOMAINS)
 
-    if st.button("Process Document"):
+    if st.button("Generate Summary"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(uploaded_file.read())
             pdf_path = tmp.name
@@ -229,33 +196,41 @@ if uploaded_file:
 
         st.success("Extraction completed")
 
-        st.header("Image Explanations")
-        for p, i, img in images:
-            st.image(img, caption=f"Page {p}, Image {i}")
-            st.write(explain_image(img, domain))
+        # ---------------- DISPLAY EXTRACTED CONTENT ----------------
+        st.header("Extracted Images")
+        if images:
+            for p, i, img in images:
+                st.image(img, caption=f"Page {p}, Image {i}")
+        else:
+            st.write("No images found.")
 
-        st.header("Table Explanations")
-        for p, table in tables:
-            st.code(table)
-            st.write(explain_table(table, domain))
+        st.header("Extracted Tables")
+        if tables:
+            for p, table in tables:
+                st.code(table)
+        else:
+            st.write("No tables found.")
 
-        st.header("Formula Explanations")
-        for f in formulas:
-            st.latex(f)
-            st.write(explain_formula(f, domain))
+        st.header("Extracted Formulas")
+        if formulas:
+            for f in formulas:
+                st.latex(f)
+        else:
+            st.write("No formulas found.")
 
-        st.header("Summarization")
+        # ---------------- SUMMARY ----------------
+        st.header("Generated Summary")
 
         bert = bert_summary(text)
         bilstm = bilstm_style_summary(text, domain)
         gemini = gemini_domain_summary(text, domain)
 
-        base = ensemble_summary(bert, bilstm, gemini, domain)
+        base_summary = ensemble_summary(bert, bilstm, gemini, domain)
 
         with st.spinner("Generating long summary"):
-            final_summary = generate_long_summary(base, text, domain)
+            final_summary = generate_long_summary(base_summary, text, domain)
 
-        st.write("Word count:", word_count(final_summary))
+        st.write(f"Total word count: {word_count(final_summary)}")
         st.write(final_summary)
 
         os.remove(pdf_path)
