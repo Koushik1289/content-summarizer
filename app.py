@@ -12,11 +12,11 @@ from transformers import pipeline
 # PAGE CONFIG
 # --------------------------------------------------
 st.set_page_config(
-    page_title="Domain-Aware PDF Summarizer",
+    page_title="Multi-Model PDF Summarizer",
     layout="wide"
 )
 
-st.title("Domain-Aware PDF Summarizer")
+st.title("Multi-Model PDF Summarizer")
 
 # --------------------------------------------------
 # LOAD API KEY FROM STREAMLIT CLOUD SECRETS
@@ -28,9 +28,9 @@ if "GEMINI_API_KEY" not in st.secrets:
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 # --------------------------------------------------
-# SINGLE STABLE MODEL
+# GEMINI MODEL (TEXT ONLY)
 # --------------------------------------------------
-model = genai.GenerativeModel("gemini-2.5-flash")
+model = genai.GenerativeModel("gemini-1.5-pro")
 
 # --------------------------------------------------
 # DOMAINS
@@ -49,19 +49,13 @@ DOMAINS = [
 ]
 
 # --------------------------------------------------
-# LOAD BERT (CACHED)
+# LOAD BERT SUMMARIZER (CACHED)
 # --------------------------------------------------
 @st.cache_resource
 def load_bert():
     return pipeline("summarization", model="facebook/bart-large-cnn")
 
 bert_summarizer = load_bert()
-
-# --------------------------------------------------
-# UTIL
-# --------------------------------------------------
-def word_count(text):
-    return len(text.split())
 
 # --------------------------------------------------
 # PDF EXTRACTION
@@ -85,98 +79,70 @@ def extract_pdf_components(pdf_path):
             image = Image.open(io.BytesIO(img_bytes))
             images.append((page_no, img_idx + 1, image))
 
-        # Tables (raw blocks)
+        # Tables (raw text blocks)
         for block in page.get_text("blocks"):
             if "\t" in block[4]:
                 tables.append((page_no, block[4]))
 
-        # Formulas (raw)
+        # Formulas (raw patterns)
         formulas.extend(re.findall(r"\$.*?\$|\\\[.*?\\\]", page_text))
 
     return full_text, images, tables, formulas
 
 # --------------------------------------------------
-# SUMMARIZATION
+# SUMMARY GENERATORS (<= 5000 CHARS EACH)
 # --------------------------------------------------
-def bert_summary(text):
-    return bert_summarizer(
-        text[:3000],
+def bert_summary(text, max_chars=5000):
+    chunk = text[:3000]  # BERT input limit
+    summary = bert_summarizer(
+        chunk,
         max_length=180,
         min_length=80,
         do_sample=False
     )[0]["summary_text"]
+    return summary[:max_chars]
 
-def bilstm_style_summary(text, domain):
+def bilstm_style_summary(text, domain, max_chars=5000):
+    limited_text = text[:12000]
+
     prompt = f"""
-    Generate an abstractive summary similar to a BiLSTM-LSTM model.
+    You are generating a summary in the style of a BiLSTM-based sequence model.
     Domain: {domain}
 
-    Text:
-    {text}
+    Characteristics:
+    - Abstractive
+    - Smooth sequential flow
+    - Captures context across the document
+    - No headings or bullet points
+
+    Document:
+    {limited_text}
     """
-    return model.generate_content(prompt).text
 
-def gemini_domain_summary(text, domain):
+    response = model.generate_content(prompt)
+    return response.text[:max_chars]
+
+def hybrid_summary(bert_sum, bilstm_sum, domain, max_chars=5000):
     prompt = f"""
-    You are a domain expert in {domain}.
-    Generate a detailed domain-aware summary.
-
-    Text:
-    {text}
-    """
-    return model.generate_content(prompt).text
-
-def ensemble_summary(bert, bilstm, gemini, domain):
-    prompt = f"""
-    Combine the following summaries into a single coherent summary.
-
+    Combine the two summaries below into a single coherent summary.
     Domain: {domain}
 
-    BERT Summary:
-    {bert}
+    Requirements:
+    - Preserve factual precision from BERT-style summary
+    - Preserve contextual flow from BiLSTM-style summary
+    - Single continuous text
+    - No headings or lists
+    - Maximum {max_chars} characters
 
-    BiLSTM Summary:
-    {bilstm}
+    BERT-style summary:
+    {bert_sum}
 
-    Gemini Summary:
-    {gemini}
+    BiLSTM-style summary:
+    {bilstm_sum}
     """
-    return model.generate_content(prompt).text
 
-# --------------------------------------------------
-# LONG SUMMARY (>= 4000 WORDS)
-# --------------------------------------------------
-def generate_long_summary(base_summary, source_text, domain, min_words=4000):
-    final_summary = base_summary
-
-    sections = [
-        "Introduction and Background",
-        "Context and Motivation",
-        "Detailed Content Overview",
-        "Conceptual and Technical Analysis",
-        "Domain-Specific Perspective",
-        "Practical Implications",
-        "Challenges and Limitations",
-        "Future Scope",
-        "Conclusion"
-    ]
-
-    for section in sections:
-        if word_count(final_summary) >= min_words:
-            break
-
-        prompt = f"""
-        Write a detailed section titled '{section}' for a {domain} audience.
-        Minimum 500 words.
-        Do not repeat previous content.
-
-        Reference text:
-        {source_text[:6000]}
-        """
-        section_text = model.generate_content(prompt).text
-        final_summary += f"\n\n## {section}\n{section_text}"
-
-    return final_summary
+    response = model.generate_content(prompt)
+    return response.text[:max_chars]
 
 # --------------------------------------------------
 # UI FLOW
@@ -186,7 +152,7 @@ uploaded_file = st.file_uploader("Upload PDF document", type="pdf")
 if uploaded_file:
     domain = st.selectbox("Select summary domain", DOMAINS)
 
-    if st.button("Generate Summary"):
+    if st.button("Generate Summaries"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(uploaded_file.read())
             pdf_path = tmp.name
@@ -218,19 +184,28 @@ if uploaded_file:
         else:
             st.write("No formulas found.")
 
-        # ---------------- SUMMARY ----------------
-        st.header("Generated Summary")
+        # ---------------- SUMMARIES ----------------
+        st.header("Generated Summaries")
 
-        bert = bert_summary(text)
-        bilstm = bilstm_style_summary(text, domain)
-        gemini = gemini_domain_summary(text, domain)
+        with st.spinner("Generating BERT-style summary"):
+            summary_bert = bert_summary(text)
 
-        base_summary = ensemble_summary(bert, bilstm, gemini, domain)
+        with st.spinner("Generating BiLSTM-style summary"):
+            summary_bilstm = bilstm_style_summary(text, domain)
 
-        with st.spinner("Generating long summary"):
-            final_summary = generate_long_summary(base_summary, text, domain)
+        with st.spinner("Generating Hybrid summary"):
+            summary_hybrid = hybrid_summary(summary_bert, summary_bilstm, domain)
 
-        st.write(f"Total word count: {word_count(final_summary)}")
-        st.write(final_summary)
+        st.subheader("BERT-style Summary")
+        st.write(f"Length: {len(summary_bert)} characters")
+        st.write(summary_bert)
+
+        st.subheader("BiLSTM-style Summary")
+        st.write(f"Length: {len(summary_bilstm)} characters")
+        st.write(summary_bilstm)
+
+        st.subheader("Hybrid (BERT + BiLSTM) Summary")
+        st.write(f"Length: {len(summary_hybrid)} characters")
+        st.write(summary_hybrid)
 
         os.remove(pdf_path)
