@@ -6,7 +6,6 @@ import io
 import tempfile
 import os
 import re
-from transformers import pipeline
 
 # --------------------------------------------------
 # PAGE CONFIG
@@ -16,20 +15,18 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Multi-Model PDF Summarizer")
+st.title("📄 Multi-Model PDF Summarizer")
 
 # --------------------------------------------------
 # LOAD API KEY FROM STREAMLIT CLOUD SECRETS
 # --------------------------------------------------
-if "GEMINI_API_KEY" not in st.secrets:
-    st.error("GEMINI_API_KEY not found in Streamlit Cloud secrets.")
+if "API_KEY" not in st.secrets:
+    st.error("API key not configured.")
     st.stop()
 
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+genai.configure(api_key=st.secrets["API_KEY"])
 
-# --------------------------------------------------
-# SAFE MODEL FOR STREAMLIT CLOUD
-# --------------------------------------------------
+# Internal AI model (not exposed)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
 # --------------------------------------------------
@@ -49,22 +46,17 @@ DOMAINS = [
 ]
 
 # --------------------------------------------------
-# LOAD BERT (CACHED)
-# --------------------------------------------------
-@st.cache_resource
-def load_bert():
-    return pipeline("summarization", model="facebook/bart-large-cnn")
-
-bert_summarizer = load_bert()
-
-# --------------------------------------------------
-# SAFE GEMINI CALL
+# SAFE AI CALL
 # --------------------------------------------------
 def safe_generate(prompt):
     try:
-        return model.generate_content(prompt).text
-    except Exception:
+        response = model.generate_content(prompt)
+        if response and hasattr(response, "text"):
+            return response.text
         return ""
+    except Exception:
+        return "Unable to generate output at this time."
+
 
 # --------------------------------------------------
 # PDF EXTRACTION
@@ -78,54 +70,51 @@ def extract_pdf_components(pdf_path):
 
     for page_no, page in enumerate(doc, start=1):
         page_text = page.get_text()
-        text += page_text
+        text += page_text + "\n"
 
+        # Extract Images
         for img_idx, img in enumerate(page.get_images(full=True)):
             xref = img[0]
-            img_bytes = doc.extract_image(xref)["image"]
+            base_image = doc.extract_image(xref)
+            img_bytes = base_image["image"]
             image = Image.open(io.BytesIO(img_bytes))
             images.append((page_no, img_idx + 1, image, page_text))
 
+        # Extract Tables
         for block in page.get_text("blocks"):
             if "\t" in block[4]:
                 tables.append((page_no, block[4]))
 
+        # Extract Formulas
         formulas.extend(re.findall(r"\$.*?\$|\\\[.*?\\\]", page_text))
 
+    doc.close()
     return text, images, tables, formulas
 
+
 # --------------------------------------------------
-# IMAGE EXPLANATION (TEXT-BASED)
+# IMAGE EXPLANATION
 # --------------------------------------------------
 def explain_image_from_text(page_text, domain):
     prompt = f"""
-    You are a domain expert in {domain}.
-    Based on the following page text, infer the purpose of the image
-    and explain its role briefly.
+    You are an expert in {domain}.
+    Based on the following page content, explain the likely purpose 
+    and role of the extracted image in 3–5 concise sentences.
 
-    Page text:
-    {page_text[:1200]}
+    Page content:
+    {page_text[:1500]}
     """
     return safe_generate(prompt)
 
-# --------------------------------------------------
-# SUMMARY FUNCTIONS (≈ 3000 CHARS EACH)
-# --------------------------------------------------
-def bert_summary(text, target_chars=3000):
-    chunk = text[:3500]
-    summary = bert_summarizer(
-        chunk,
-        max_length=220,
-        min_length=150,
-        do_sample=False
-    )[0]["summary_text"]
-    return summary[:target_chars]
 
-def bilstm_style_summary(text, domain, target_chars=3000):
-    limited_text = text[:12000]
+# --------------------------------------------------
+# SUMMARY FUNCTIONS
+# --------------------------------------------------
+def bert_style_summary(text, domain, target_chars=3000):
+    limited_text = text[:15000]
 
     prompt = f"""
-    Generate an abstractive summary similar to a BiLSTM-based sequence model.
+    Generate an extractive-style summary similar to a transformer-based summarizer.
     Domain: {domain}
     Single continuous text.
     Target length: approximately {target_chars} characters.
@@ -133,80 +122,106 @@ def bilstm_style_summary(text, domain, target_chars=3000):
     Document:
     {limited_text}
     """
-
     return safe_generate(prompt)[:target_chars]
 
-def hybrid_summary(bert_sum, bilstm_sum, domain, target_chars=3000):
+
+def bilstm_style_summary(text, domain, target_chars=3000):
+    limited_text = text[:15000]
+
     prompt = f"""
-    Combine the two summaries below into one coherent summary.
+    Generate an abstractive summary similar to a sequence-to-sequence model.
+    Domain: {domain}
+    Single continuous text.
+    Target length: approximately {target_chars} characters.
+
+    Document:
+    {limited_text}
+    """
+    return safe_generate(prompt)[:target_chars]
+
+
+def hybrid_summary(summary_a, summary_b, domain, target_chars=3000):
+    prompt = f"""
+    Combine the two summaries below into one coherent, high-quality summary.
     Domain: {domain}
     Single continuous text.
     Target length: approximately {target_chars} characters.
 
     Summary A:
-    {bert_sum}
+    {summary_a}
 
     Summary B:
-    {bilstm_sum}
+    {summary_b}
     """
-
     return safe_generate(prompt)[:target_chars]
+
 
 # --------------------------------------------------
 # UI FLOW
 # --------------------------------------------------
-uploaded_file = st.file_uploader("Upload PDF document", type="pdf")
+uploaded_file = st.file_uploader("📤 Upload PDF document", type="pdf")
 
 if uploaded_file:
-    domain = st.selectbox("Select summary domain", DOMAINS)
+    domain = st.selectbox("📚 Select Summary Domain", DOMAINS)
 
-    if st.button("Generate Output"):
+    if st.button("🚀 Generate Output"):
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(uploaded_file.read())
             pdf_path = tmp.name
 
-        with st.spinner("Extracting content"):
+        with st.spinner("🔍 Extracting content from PDF..."):
             text, images, tables, formulas = extract_pdf_components(pdf_path)
 
-        st.success("Extraction completed")
+        st.success("Extraction completed successfully.")
 
         # ---------------- IMAGES ----------------
-        st.header("Extracted Images and Context-Based Explanations")
-        for p, i, img, page_text in images:
-            st.image(img, caption=f"Page {p}, Image {i}")
-            st.write(explain_image_from_text(page_text, domain))
+        if images:
+            st.header("🖼 Extracted Images & Context-Based Explanation")
+            for p, i, img, page_text in images:
+                st.image(img, caption=f"Page {p}, Image {i}")
+                explanation = explain_image_from_text(page_text, domain)
+                st.write(explanation)
+        else:
+            st.info("No images found.")
 
         # ---------------- TABLES ----------------
-        st.header("Extracted Tables")
-        for p, table in tables:
-            st.code(table)
+        if tables:
+            st.header("📊 Extracted Tables")
+            for p, table in tables:
+                st.code(table)
+        else:
+            st.info("No tables detected.")
 
         # ---------------- FORMULAS ----------------
-        st.header("Extracted Formulas")
-        for f in formulas:
-            st.latex(f)
+        if formulas:
+            st.header("🧮 Extracted Formulas")
+            for f in formulas:
+                st.latex(f)
+        else:
+            st.info("No formulas detected.")
 
         # ---------------- SUMMARIES ----------------
-        st.header("Generated Summaries")
+        st.header("📝 Generated Summaries")
 
-        with st.spinner("Generating BERT-style summary"):
-            s_bert = bert_summary(text)
+        with st.spinner("Generating Summary A..."):
+            s_bert = bert_style_summary(text, domain)
 
-        with st.spinner("Generating BiLSTM-style summary"):
+        with st.spinner("Generating Summary B..."):
             s_bilstm = bilstm_style_summary(text, domain)
 
-        with st.spinner("Generating Hybrid summary"):
+        with st.spinner("Generating Final Summary..."):
             s_hybrid = hybrid_summary(s_bert, s_bilstm, domain)
 
-        st.subheader("BERT-style Summary")
+        st.subheader("🔹 Summary A")
         st.write(f"Characters: {len(s_bert)}")
         st.write(s_bert)
 
-        st.subheader("BiLSTM-style Summary")
+        st.subheader("🔹 Summary B")
         st.write(f"Characters: {len(s_bilstm)}")
         st.write(s_bilstm)
 
-        st.subheader("Hybrid Summary (BERT + BiLSTM)")
+        st.subheader("🔹 Final Combined Summary")
         st.write(f"Characters: {len(s_hybrid)}")
         st.write(s_hybrid)
 
