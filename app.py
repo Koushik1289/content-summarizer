@@ -18,15 +18,15 @@ st.set_page_config(
 st.title("📄 Multi-Model PDF Summarizer")
 
 # --------------------------------------------------
-# LOAD API KEY FROM STREAMLIT CLOUD SECRETS
+# LOAD API KEY FROM STREAMLIT SECRETS
 # --------------------------------------------------
 if "API_KEY" not in st.secrets:
-    st.error("API key not configured.")
+    st.error("System configuration error. Please contact administrator.")
     st.stop()
 
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-# Internal AI model (not exposed)
+# Internal AI model (not exposed in UI)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
 # --------------------------------------------------
@@ -51,9 +51,9 @@ DOMAINS = [
 def safe_generate(prompt):
     try:
         response = model.generate_content(prompt)
-        if response and hasattr(response, "text"):
-            return response.text
-        return ""
+        if response and hasattr(response, "text") and response.text:
+            return response.text.strip()
+        return "No output generated."
     except Exception:
         return "Unable to generate output at this time."
 
@@ -80,7 +80,7 @@ def extract_pdf_components(pdf_path):
             image = Image.open(io.BytesIO(img_bytes))
             images.append((page_no, img_idx + 1, image, page_text))
 
-        # Extract Tables
+        # Extract Tables (basic heuristic)
         for block in page.get_text("blocks"):
             if "\t" in block[4]:
                 tables.append((page_no, block[4]))
@@ -110,7 +110,7 @@ def explain_image_from_text(page_text, domain):
 # --------------------------------------------------
 # SUMMARY FUNCTIONS
 # --------------------------------------------------
-def bert_style_summary(text, domain, target_chars=3000):
+def summary_style_a(text, domain, target_chars=3000):
     limited_text = text[:15000]
 
     prompt = f"""
@@ -125,7 +125,7 @@ def bert_style_summary(text, domain, target_chars=3000):
     return safe_generate(prompt)[:target_chars]
 
 
-def bilstm_style_summary(text, domain, target_chars=3000):
+def summary_style_b(text, domain, target_chars=3000):
     limited_text = text[:15000]
 
     prompt = f"""
@@ -140,7 +140,7 @@ def bilstm_style_summary(text, domain, target_chars=3000):
     return safe_generate(prompt)[:target_chars]
 
 
-def hybrid_summary(summary_a, summary_b, domain, target_chars=3000):
+def combined_summary(summary_a, summary_b, domain, target_chars=3000):
     prompt = f"""
     Combine the two summaries below into one coherent, high-quality summary.
     Domain: {domain}
@@ -205,24 +205,24 @@ if uploaded_file:
         st.header("📝 Generated Summaries")
 
         with st.spinner("Generating Summary A..."):
-            s_bert = bert_style_summary(text, domain)
+            s_a = summary_style_a(text, domain)
 
         with st.spinner("Generating Summary B..."):
-            s_bilstm = bilstm_style_summary(text, domain)
+            s_b = summary_style_b(text, domain)
 
         with st.spinner("Generating Final Summary..."):
-            s_hybrid = hybrid_summary(s_bert, s_bilstm, domain)
+            s_final = combined_summary(s_a, s_b, domain)
 
         st.subheader("🔹 Summary A")
-        st.write(f"Characters: {len(s_bert)}")
-        st.write(s_bert)
+        st.write(f"Characters: {len(s_a)}")
+        st.write(s_a)
 
         st.subheader("🔹 Summary B")
-        st.write(f"Characters: {len(s_bilstm)}")
-        st.write(s_bilstm)
+        st.write(f"Characters: {len(s_b)}")
+        st.write(s_b)
 
         st.subheader("🔹 Final Combined Summary")
-        st.write(f"Characters: {len(s_hybrid)}")
-        st.write(s_hybrid)
+        st.write(f"Characters: {len(s_final)}")
+        st.write(s_final)
 
         os.remove(pdf_path)
