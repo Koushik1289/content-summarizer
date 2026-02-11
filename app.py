@@ -24,7 +24,7 @@ if "API_KEY" not in st.secrets:
     st.error("System configuration error. Please contact administrator.")
     st.stop()
 
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+genai.configure(api_key=st.secrets["API_KEY"])
 
 # Internal AI model (not exposed in UI)
 model = genai.GenerativeModel("gemini-2.5-flash")
